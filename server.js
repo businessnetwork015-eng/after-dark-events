@@ -10,22 +10,23 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Ensure upload directory exists
-if (!fs.existsSync('./uploads')) {
-    fs.mkdirSync('./uploads');
+// 1. Ensure absolute path for uploads folder
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 // Multer Storage Configuration
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+    destination: (req, file, cb) => cb(null, uploadDir),
+    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '_'))
 });
 const upload = multer({ storage });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static('public'));
-app.use('/uploads', express.static('uploads'));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(uploadDir));
 
 // Initialize SQLite Database
 const db = new sqlite3.Database('./database.sqlite', (err) => {
@@ -51,12 +52,14 @@ db.serialize(() => {
     `);
 });
 
-// Nodemailer Transporter
+// 2. Production-ready Nodemailer Transporter (Handles Cloud SMTP)
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true, // SSL
     auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
+        user: (process.env.EMAIL_USER || '').trim(),
+        pass: (process.env.EMAIL_PASS || '').trim()
     }
 });
 
@@ -98,6 +101,23 @@ async function sendApprovedTicketEmail(user) {
 
     const qrDataURL = await QRCode.toDataURL(qrData);
 
+    const attachments = [
+        {
+            filename: 'ticket-qr.png',
+            path: qrDataURL,
+            cid: 'ticketqrcode'
+        }
+    ];
+
+    // 3. Safe check for poster existence before attaching
+    const posterPath = path.join(__dirname, 'public', 'assets', 'poster.jpg');
+    if (fs.existsSync(posterPath)) {
+        attachments.push({
+            filename: 'EventPoster.jpg',
+            path: posterPath
+        });
+    }
+
     const mailOptions = {
         from: `"AFTER DARK Team" <${process.env.EMAIL_USER}>`,
         to: user.email,
@@ -127,28 +147,22 @@ async function sendApprovedTicketEmail(user) {
                 <p style="font-size: 13px; color: #999;">* Welcome drinks available inside the venue.<br>* Please carry a valid digital/physical ID along with this email pass.</p>
             </div>
         `,
-        attachments: [
-            {
-                filename: 'ticket-qr.png',
-                path: qrDataURL,
-                cid: 'ticketqrcode'
-            },
-            {
-                filename: 'EventPoster.jpg',
-                path: path.join(__dirname, 'public/assets/poster.jpg')
-            }
-        ]
+        attachments: attachments
     };
+
     return transporter.sendMail(mailOptions);
 }
 
 // Routes
 app.post('/api/book', upload.single('screenshot'), (req, res) => {
     const { name, email, phone, tickets, utr_number } = req.body;
-    const ticketCount = parseInt(tickets) || 1;
-    const amount = ticketCount * parseInt(process.env.TICKET_PRICE);
+    const ticketCount = parseInt(tickets, 10) || 1;
+    const unitPrice = parseInt(process.env.TICKET_PRICE, 10) || 499;
+    const amount = ticketCount * unitPrice;
     const userId = 'AD-' + Math.random().toString(36).substring(2, 7).toUpperCase();
-    const screenshotPath = req.file ? req.file.path : null;
+    
+    // 4. Store a clean web path for serving screenshot
+    const screenshotPath = req.file ? `uploads/${req.file.filename}` : null;
 
     const query = `
         INSERT INTO bookings (user_id, name, email, phone, tickets, amount, utr_number, screenshot_path, status)
@@ -156,10 +170,15 @@ app.post('/api/book', upload.single('screenshot'), (req, res) => {
     `;
 
     db.run(query, [userId, name, email, phone, ticketCount, amount, utr_number, screenshotPath], function (err) {
-        if (err) return res.status(500).json({ success: false, message: 'Database error.' });
+        if (err) {
+            console.error('Database Error:', err);
+            return res.status(500).json({ success: false, message: 'Database error.' });
+        }
         
+        // Attempt email dispatch asynchronously
         sendPendingEmail({ name, email, user_id: userId, utr_number })
-            .catch(err => console.error('Error sending confirmation email:', err));
+            .then(() => console.log(`Confirmation email sent to ${email}`))
+            .catch(emailErr => console.error('SMTP Pending Email Error:', emailErr.message));
 
         res.json({ success: true, bookingId: userId });
     });
@@ -188,19 +207,24 @@ app.post('/api/admin/approve/:id', (req, res) => {
         if (err || !user) return res.status(404).json({ success: false, message: 'Booking not found.' });
 
         db.run(`UPDATE bookings SET status = 'APPROVED' WHERE id = ?`, [bookingId], async (updateErr) => {
-            if (updateErr) return res.status(500).json({ success: false, message: 'Update failed.' });
+            if (updateErr) {
+                console.error('Database update error:', updateErr);
+                return res.status(500).json({ success: false, message: 'Database update failed.' });
+            }
             
             try {
                 await sendApprovedTicketEmail(user);
+                console.log(`Ticket email dispatched to ${user.email}`);
                 res.json({ success: true, message: 'Approved and Ticket sent.' });
             } catch (mailErr) {
-                console.error(mailErr);
-                res.status(500).json({ success: false, message: 'Status updated but failed to send email.' });
+                console.error('SMTP Ticket Approval Email Error:', mailErr);
+                res.status(500).json({ success: false, message: 'Status updated, but email failed: ' + mailErr.message });
             }
         });
     });
 });
 
+// 5. Explicit 0.0.0.0 host binding for container environments
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
 });
