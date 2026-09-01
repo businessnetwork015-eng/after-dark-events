@@ -1,6 +1,6 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 const QRCode = require('qrcode');
 const multer = require('multer');
 const path = require('path');
@@ -10,7 +10,10 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// 1. Ensure absolute path for uploads folder
+// Initialize Resend API
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Absolute path for uploads directory
 const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
@@ -52,22 +55,11 @@ db.serialize(() => {
     `);
 });
 
-// 2. Production-ready Nodemailer Transporter (Handles Cloud SMTP)
-const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true, // SSL
-    auth: {
-        user: (process.env.EMAIL_USER || '').trim(),
-        pass: (process.env.EMAIL_PASS || '').trim()
-    }
-});
-
-// Helper: Send Step 1 Acknowledgment Email
+// Helper: Send Step 1 Acknowledgment Email via HTTP API
 async function sendPendingEmail(user) {
-    const mailOptions = {
-        from: `"AFTER DARK Team" <${process.env.EMAIL_USER}>`,
-        to: user.email,
+    const { data, error } = await resend.emails.send({
+        from: 'AFTER DARK <onboarding@resend.dev>',
+        to: [user.email],
         subject: `Payment Received - Booking Under Verification [ID: ${user.user_id}]`,
         html: `
             <div style="background-color: #0b0b0b; color: #fff; padding: 25px; font-family: Arial, sans-serif; border: 1px solid #ff1a1a; border-radius: 8px;">
@@ -83,11 +75,15 @@ async function sendPendingEmail(user) {
                 <p style="font-size: 12px; color: #888;">Venue: SIERA BEACH HOTEL, Near IT SEZ Beach Road, Rushikonda<br>Date: September 19th | Time: 6:00 PM to 9:30 PM</p>
             </div>
         `
-    };
-    return transporter.sendMail(mailOptions);
+    });
+
+    if (error) {
+        throw new Error(JSON.stringify(error));
+    }
+    return data;
 }
 
-// Helper: Send Step 2 Final Ticket Email
+// Helper: Send Step 2 Final Ticket Email via HTTP API
 async function sendApprovedTicketEmail(user) {
     const qrData = JSON.stringify({
         event: "AFTER DARK",
@@ -99,28 +95,28 @@ async function sendApprovedTicketEmail(user) {
         tickets: user.tickets
     });
 
-    const qrDataURL = await QRCode.toDataURL(qrData);
+    // Generate buffer directly for attachment
+    const qrBuffer = await QRCode.toBuffer(qrData);
 
     const attachments = [
         {
             filename: 'ticket-qr.png',
-            path: qrDataURL,
-            cid: 'ticketqrcode'
+            content: qrBuffer
         }
     ];
 
-    // 3. Safe check for poster existence before attaching
     const posterPath = path.join(__dirname, 'public', 'assets', 'poster.jpg');
     if (fs.existsSync(posterPath)) {
+        const posterBuffer = fs.readFileSync(posterPath);
         attachments.push({
             filename: 'EventPoster.jpg',
-            path: posterPath
+            content: posterBuffer
         });
     }
 
-    const mailOptions = {
-        from: `"AFTER DARK Team" <${process.env.EMAIL_USER}>`,
-        to: user.email,
+    const { data, error } = await resend.emails.send({
+        from: 'AFTER DARK <onboarding@resend.dev>',
+        to: [user.email],
         subject: `CONFIRMED: Your Official Pass for AFTER DARK [ID: ${user.user_id}]`,
         html: `
             <div style="background-color: #050505; color: #ffffff; padding: 30px; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; border: 2px solid #e50914; border-radius: 10px; max-width: 600px; margin: auto;">
@@ -130,12 +126,11 @@ async function sendApprovedTicketEmail(user) {
                 </div>
 
                 <p>Hey <strong>${user.name}</strong>,</p>
-                <p>Your payment has been verified successfully. Here is your official pass to the event!</p>
+                <p>Your payment has been verified successfully. Your official pass and event poster are attached to this email!</p>
                 
                 <div style="background-color: #121212; border: 1px dashed #ff2a2a; border-radius: 8px; padding: 20px; text-align: center; margin: 20px 0;">
                     <h3 style="color: #fff; margin-top: 0;">OFFICIAL ENTRY PASS</h3>
-                    <img src="cid:ticketqrcode" alt="Entry QR Code" style="width: 180px; height: 180px; margin: 10px auto; display: block;" />
-                    <p style="font-size: 12px; color: #888;">Scan at the entrance counter for entry</p>
+                    <p style="font-size: 13px; color: #ff3333;">(Please download and present the attached <strong>ticket-qr.png</strong> at the gate)</p>
                     <hr style="border: 0; border-top: 1px solid #222; margin: 15px 0;">
                     <p style="margin: 4px 0; color: #eee;"><strong>Attendee:</strong> ${user.name}</p>
                     <p style="margin: 4px 0; color: #eee;"><strong>Pass ID:</strong> ${user.user_id}</p>
@@ -144,13 +139,16 @@ async function sendApprovedTicketEmail(user) {
                     <p style="margin: 4px 0; color: #aaa; font-size: 13px;"><strong>Venue:</strong> SIERA BEACH HOTEL, Rushikonda</p>
                 </div>
 
-                <p style="font-size: 13px; color: #999;">* Welcome drinks available inside the venue.<br>* Please carry a valid digital/physical ID along with this email pass.</p>
+                <p style="font-size: 13px; color: #999;">* Welcome drinks available inside the venue.<br>* Please carry a valid digital/physical ID along with this pass.</p>
             </div>
         `,
         attachments: attachments
-    };
+    });
 
-    return transporter.sendMail(mailOptions);
+    if (error) {
+        throw new Error(JSON.stringify(error));
+    }
+    return data;
 }
 
 // Routes
@@ -160,8 +158,6 @@ app.post('/api/book', upload.single('screenshot'), (req, res) => {
     const unitPrice = parseInt(process.env.TICKET_PRICE, 10) || 499;
     const amount = ticketCount * unitPrice;
     const userId = 'AD-' + Math.random().toString(36).substring(2, 7).toUpperCase();
-    
-    // 4. Store a clean web path for serving screenshot
     const screenshotPath = req.file ? `uploads/${req.file.filename}` : null;
 
     const query = `
@@ -175,10 +171,9 @@ app.post('/api/book', upload.single('screenshot'), (req, res) => {
             return res.status(500).json({ success: false, message: 'Database error.' });
         }
         
-        // Attempt email dispatch asynchronously
         sendPendingEmail({ name, email, user_id: userId, utr_number })
-            .then(() => console.log(`Confirmation email sent to ${email}`))
-            .catch(emailErr => console.error('SMTP Pending Email Error:', emailErr.message));
+            .then(() => console.log(`Confirmation email sent via API to ${email}`))
+            .catch(emailErr => console.error('Resend Pending Email Error:', emailErr.message));
 
         res.json({ success: true, bookingId: userId });
     });
@@ -214,17 +209,16 @@ app.post('/api/admin/approve/:id', (req, res) => {
             
             try {
                 await sendApprovedTicketEmail(user);
-                console.log(`Ticket email dispatched to ${user.email}`);
+                console.log(`Ticket email dispatched via API to ${user.email}`);
                 res.json({ success: true, message: 'Approved and Ticket sent.' });
             } catch (mailErr) {
-                console.error('SMTP Ticket Approval Email Error:', mailErr);
-                res.status(500).json({ success: false, message: 'Status updated, but email failed: ' + mailErr.message });
+                console.error('Resend Ticket Approval Email Error:', mailErr);
+                res.status(500).json({ success: false, message: 'Status updated, but email delivery failed.' });
             }
         });
     });
 });
 
-// 5. Explicit 0.0.0.0 host binding for container environments
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
 });
