@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AFTER DARK - Admin Panel</title>
+    <style>
+        body { background: #0c0c0c; color: #fff; font-family: sans-serif; padding: 30px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #333; padding: 12px; text-align: left; }
+        th { background: #191919; color: #ff1e27; }
+        .btn-approve { background: #008f39; color: #fff; border:none; padding: 6px 12px; cursor: pointer; border-radius: 4px;}
+        .status-APPROVED { color: #00ff66; font-weight: bold; }
+        .status-PENDING { color: #ffae00; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>Booking Management Dashboard</h2>
+    <input type="password" id="adminPass" placeholder="Enter Admin Password">
+    <button onclick="loadBookings()">Load Data</button>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Booking ID</th>
+                <th>Name</th>
+                <th>Email</th>
+                <th>Tickets</th>
+                <th>Amount</th>
+                <th>UTR No.</th>
+                <th>Proof</th>
+                <th>Status</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody id="tableBody"></tbody>
+    </table>
+
+    <script>
+        async function loadBookings() {
+            const pass = document.getElementById('adminPass').value;
+            const res = await fetch(`/api/admin/bookings?password=${encodeURIComponent(pass)}`);
+            if (res.status === 401) return alert('Invalid Password');
+            const data = await res.json();
+            
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+            data.forEach(row => {
+                tbody.innerHTML += `
+                    <tr>
+                        <td>${row.user_id}</td>
+                        <td>${row.name}</td>
+                        <td>${row.email}</td>
+                        <td>${row.tickets}</td>
+                        <td>₹${row.amount}</td>
+                        <td>${row.utr_number}</td>
+                        <td><a href="/${row.screenshot_path}" target="_blank" style="color:#ff1e27;">View Proof</a></td>
+                        <td class="status-${row.status}">${row.status}</td>
+                        <td>
+                            ${row.status === 'PENDING' ? `<button class="btn-approve" onclick="approveBooking(${row.id})">Approve & Send Ticket</button>` : 'Verified'}
+                        </td>
+                    </tr>
+                `;
+            });
+        }
+
+        async function approveBooking(id) {
+            const pass = document.getElementById('adminPass').value;
+            const res = await fetch(`/api/admin/approve/${id}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password: pass })
+            });
+            const data = await res.json();
+            if (data.success) {
+                alert('Ticket approved & sent to customer email successfully.');
+                loadBookings();
+            } else {
+                alert('Failed to process approval.');
+            }
+        }
+    </script>
+</body>
+</html>
