@@ -2,7 +2,6 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const Brevo = require('@getbrevo/brevo');
 const QRCode = require('qrcode');
-const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
@@ -11,29 +10,20 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Initialize Brevo API
+const brevoKey = (process.env.BREVO_API_KEY || '').trim();
+if (!brevoKey) {
+    console.error("⚠️ CRITICAL: BREVO_API_KEY is missing from environment variables!");
+}
+
 const apiInstance = new Brevo.TransactionalEmailsApi();
 apiInstance.setApiKey(
     Brevo.TransactionalEmailsApiApiKeys.apiKey,
-    process.env.BREVO_API_KEY
+    brevoKey
 );
-
-// Absolute path for uploads directory
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// Multer Storage Configuration
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '_'))
-});
-const upload = multer({ storage });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(uploadDir));
 
 // Initialize SQLite Database
 const db = new sqlite3.Database('./database.sqlite', (err) => {
@@ -52,18 +42,17 @@ db.serialize(() => {
             tickets INTEGER,
             amount INTEGER,
             utr_number TEXT,
-            screenshot_path TEXT,
             status TEXT DEFAULT 'PENDING',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     `);
 });
 
-// Helper: Send Step 1 Acknowledgment Email
+// Send Step 1 Acknowledgment Email
 async function sendPendingEmail(user) {
     const sendSmtpEmail = new Brevo.SendSmtpEmail();
     sendSmtpEmail.subject = `Payment Received - Booking Under Verification [ID: ${user.user_id}]`;
-    sendSmtpEmail.sender = { name: "AFTER DARK Team", email: process.env.EMAIL_USER };
+    sendSmtpEmail.sender = { name: "AFTER DARK Team", email: (process.env.EMAIL_USER || '').trim() };
     sendSmtpEmail.to = [{ email: user.email, name: user.name }];
     sendSmtpEmail.htmlContent = `
         <div style="background-color: #0b0b0b; color: #fff; padding: 25px; font-family: Arial, sans-serif; border: 1px solid #ff1a1a; border-radius: 8px;">
@@ -83,7 +72,7 @@ async function sendPendingEmail(user) {
     return apiInstance.sendTransacEmail(sendSmtpEmail);
 }
 
-// Helper: Send Step 2 Final Ticket Email
+// Send Step 2 Final Ticket Email
 async function sendApprovedTicketEmail(user) {
     const qrData = JSON.stringify({
         event: "AFTER DARK",
@@ -114,7 +103,7 @@ async function sendApprovedTicketEmail(user) {
 
     const sendSmtpEmail = new Brevo.SendSmtpEmail();
     sendSmtpEmail.subject = `CONFIRMED: Your Official Pass for AFTER DARK [ID: ${user.user_id}]`;
-    sendSmtpEmail.sender = { name: "AFTER DARK Team", email: process.env.EMAIL_USER };
+    sendSmtpEmail.sender = { name: "AFTER DARK Team", email: (process.env.EMAIL_USER || '').trim() };
     sendSmtpEmail.to = [{ email: user.email, name: user.name }];
     sendSmtpEmail.attachment = attachments;
     sendSmtpEmail.htmlContent = `
@@ -145,21 +134,20 @@ async function sendApprovedTicketEmail(user) {
     return apiInstance.sendTransacEmail(sendSmtpEmail);
 }
 
-// Routes
-app.post('/api/book', upload.single('screenshot'), (req, res) => {
+// User Booking Submission
+app.post('/api/book', (req, res) => {
     const { name, email, phone, tickets, utr_number } = req.body;
     const ticketCount = parseInt(tickets, 10) || 1;
     const unitPrice = parseInt(process.env.TICKET_PRICE, 10) || 499;
     const amount = ticketCount * unitPrice;
     const userId = 'AD-' + Math.random().toString(36).substring(2, 7).toUpperCase();
-    const screenshotPath = req.file ? `uploads/${req.file.filename}` : null;
 
     const query = `
-        INSERT INTO bookings (user_id, name, email, phone, tickets, amount, utr_number, screenshot_path, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+        INSERT INTO bookings (user_id, name, email, phone, tickets, amount, utr_number, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
     `;
 
-    db.run(query, [userId, name, email, phone, ticketCount, amount, utr_number, screenshotPath], function (err) {
+    db.run(query, [userId, name, email, phone, ticketCount, amount, utr_number], function (err) {
         if (err) {
             console.error('Database Error:', err);
             return res.status(500).json({ success: false, message: 'Database error.' });
@@ -173,6 +161,7 @@ app.post('/api/book', upload.single('screenshot'), (req, res) => {
     });
 });
 
+// Admin View All Submissions
 app.get('/api/admin/bookings', (req, res) => {
     const { password } = req.query;
     if (password !== process.env.ADMIN_PASSWORD) {
@@ -184,6 +173,7 @@ app.get('/api/admin/bookings', (req, res) => {
     });
 });
 
+// Admin Approval Endpoint
 app.post('/api/admin/approve/:id', (req, res) => {
     const { password } = req.body;
     const bookingId = req.params.id;
