@@ -1,5 +1,5 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const Brevo = require('@getbrevo/brevo');
 const QRCode = require('qrcode');
 const path = require('path');
@@ -9,12 +9,40 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Initialize PostgreSQL Connection Pool
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false
+    }
+});
+
+// Initialize Persistent Table
+async function initDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS bookings (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(50) UNIQUE,
+                name VARCHAR(100),
+                email VARCHAR(150),
+                phone VARCHAR(20),
+                tickets INT,
+                amount INT,
+                utr_number VARCHAR(100),
+                status VARCHAR(20) DEFAULT 'PENDING',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+        console.log('✅ Connected to Persistent PostgreSQL Database.');
+    } catch (err) {
+        console.error('❌ Database connection error:', err.message);
+    }
+}
+initDB();
+
 // Initialize Brevo API
 const brevoKey = (process.env.BREVO_API_KEY || '').trim();
-if (!brevoKey) {
-    console.error("⚠️ CRITICAL: BREVO_API_KEY is missing from environment variables!");
-}
-
 const apiInstance = new Brevo.TransactionalEmailsApi();
 apiInstance.setApiKey(
     Brevo.TransactionalEmailsApiApiKeys.apiKey,
@@ -25,30 +53,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Initialize SQLite Database
-const db = new sqlite3.Database('./database.sqlite', (err) => {
-    if (err) console.error('Database connection error:', err);
-    else console.log('Connected to SQLite Database.');
-});
-
-db.serialize(() => {
-    db.run(`
-        CREATE TABLE IF NOT EXISTS bookings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT UNIQUE,
-            name TEXT,
-            email TEXT,
-            phone TEXT,
-            tickets INTEGER,
-            amount INTEGER,
-            utr_number TEXT,
-            status TEXT DEFAULT 'PENDING',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-});
-
-// Send Step 1 Acknowledgment Email
+// Helper: Send Step 1 Acknowledgment Email
 async function sendPendingEmail(user) {
     const sendSmtpEmail = new Brevo.SendSmtpEmail();
     sendSmtpEmail.subject = `Payment Received - Booking Under Verification [ID: ${user.user_id}]`;
@@ -72,7 +77,7 @@ async function sendPendingEmail(user) {
     return apiInstance.sendTransacEmail(sendSmtpEmail);
 }
 
-// Send Step 2 Final Ticket Email
+// Helper: Send Step 2 Final Ticket Email
 async function sendApprovedTicketEmail(user) {
     const qrData = JSON.stringify({
         event: "AFTER DARK",
@@ -135,46 +140,50 @@ async function sendApprovedTicketEmail(user) {
 }
 
 // User Booking Submission
-app.post('/api/book', (req, res) => {
+app.post('/api/book', async (req, res) => {
     const { name, email, phone, tickets, utr_number } = req.body;
     const ticketCount = parseInt(tickets, 10) || 1;
     const unitPrice = parseInt(process.env.TICKET_PRICE, 10) || 499;
     const amount = ticketCount * unitPrice;
     const userId = 'AD-' + Math.random().toString(36).substring(2, 7).toUpperCase();
 
-    const query = `
+    const insertQuery = `
         INSERT INTO bookings (user_id, name, email, phone, tickets, amount, utr_number, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING')
+        RETURNING *;
     `;
 
-    db.run(query, [userId, name, email, phone, ticketCount, amount, utr_number], function (err) {
-        if (err) {
-            console.error('Database Error:', err);
-            return res.status(500).json({ success: false, message: 'Database error.' });
-        }
-        
+    try {
+        await pool.query(insertQuery, [userId, name, email, phone, ticketCount, amount, utr_number]);
+
         sendPendingEmail({ name, email, user_id: userId, utr_number })
-            .then(() => console.log(`Confirmation email sent via Brevo to ${email}`))
-            .catch(emailErr => console.error('Brevo Pending Email Error:', emailErr.response ? emailErr.response.body : emailErr.message));
+            .then(() => console.log(`Confirmation email dispatched to ${email}`))
+            .catch(emailErr => console.error('Brevo Email Error:', emailErr.response ? emailErr.response.body : emailErr.message));
 
         res.json({ success: true, bookingId: userId });
-    });
+    } catch (err) {
+        console.error('Database Error:', err.message);
+        res.status(500).json({ success: false, message: 'Failed to record booking.' });
+    }
 });
 
-// Admin View All Submissions
-app.get('/api/admin/bookings', (req, res) => {
+// Admin View Submissions
+app.get('/api/admin/bookings', async (req, res) => {
     const { password } = req.query;
     if (password !== process.env.ADMIN_PASSWORD) {
         return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
-    db.all(`SELECT * FROM bookings ORDER BY id DESC`, [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
-    });
+
+    try {
+        const result = await pool.query('SELECT * FROM bookings ORDER BY id DESC');
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Admin Approval Endpoint
-app.post('/api/admin/approve/:id', (req, res) => {
+app.post('/api/admin/approve/:id', async (req, res) => {
     const { password } = req.body;
     const bookingId = req.params.id;
 
@@ -182,25 +191,27 @@ app.post('/api/admin/approve/:id', (req, res) => {
         return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
 
-    db.get(`SELECT * FROM bookings WHERE id = ?`, [bookingId], (err, user) => {
-        if (err || !user) return res.status(404).json({ success: false, message: 'Booking not found.' });
+    try {
+        const userRes = await pool.query('SELECT * FROM bookings WHERE id = $1', [bookingId]);
+        const user = userRes.rows[0];
 
-        db.run(`UPDATE bookings SET status = 'APPROVED' WHERE id = ?`, [bookingId], async (updateErr) => {
-            if (updateErr) {
-                console.error('Database update error:', updateErr);
-                return res.status(500).json({ success: false, message: 'Database update failed.' });
-            }
-            
-            try {
-                await sendApprovedTicketEmail(user);
-                console.log(`Ticket email dispatched via Brevo to ${user.email}`);
-                res.json({ success: true, message: 'Approved and Ticket sent.' });
-            } catch (mailErr) {
-                console.error('Brevo Ticket Approval Email Error:', mailErr.response ? mailErr.response.body : mailErr.message);
-                res.status(500).json({ success: false, message: 'Status updated, but email delivery failed.' });
-            }
-        });
-    });
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'Booking not found.' });
+        }
+
+        await pool.query('UPDATE bookings SET status = $1 WHERE id = $2', ['APPROVED', bookingId]);
+
+        try {
+            await sendApprovedTicketEmail(user);
+            res.json({ success: true, message: 'Approved and ticket sent.' });
+        } catch (mailErr) {
+            console.error('Brevo Approval Email Error:', mailErr.response ? mailErr.response.body : mailErr.message);
+            res.status(500).json({ success: false, message: 'Status updated, but email failed.' });
+        }
+    } catch (err) {
+        console.error('Approval Error:', err.message);
+        res.status(500).json({ success: false, message: 'Database query failed.' });
+    }
 });
 
 app.listen(PORT, '0.0.0.0', () => {
