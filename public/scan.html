@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AFTER DARK | Gate Pass Scanner</title>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <style>
+        :root {
+            --bg-black: #080808;
+            --card-bg: #141414;
+            --neon-red: #ff1e27;
+            --neon-green: #00ff66;
+            --warning-orange: #ffae00;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background: var(--bg-black);
+            color: #fff;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            text-align: center;
+        }
+
+        .container {
+            max-width: 480px;
+            margin: 0 auto;
+            background: var(--card-bg);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #333;
+            box-shadow: 0 0 20px rgba(255, 30, 39, 0.2);
+        }
+
+        h2 {
+            color: var(--neon-red);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-top: 0;
+        }
+
+        #reader {
+            width: 100%;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 2px dashed #444;
+            margin-bottom: 20px;
+        }
+
+        input {
+            width: calc(100% - 24px);
+            padding: 12px;
+            background: #202020;
+            border: 1px solid #444;
+            color: #fff;
+            border-radius: 6px;
+            margin-bottom: 12px;
+            font-size: 15px;
+            box-sizing: border-box;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            background: var(--neon-red);
+            color: #fff;
+            font-weight: bold;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 16px;
+            letter-spacing: 1px;
+        }
+
+        button:hover {
+            background: #d8131b;
+        }
+
+        .result-box {
+            margin-top: 20px;
+            padding: 16px;
+            border-radius: 8px;
+            display: none;
+            text-align: left;
+            font-size: 15px;
+            line-height: 1.5;
+        }
+
+        .result-GRANTED {
+            background: rgba(0, 255, 102, 0.1);
+            border: 2px solid var(--neon-green);
+            color: var(--neon-green);
+        }
+
+        .result-REUSED {
+            background: rgba(255, 30, 39, 0.2);
+            border: 2px solid var(--neon-red);
+            color: #ff4d4d;
+            animation: pulse 1s infinite alternate;
+        }
+
+        .result-INVALID {
+            background: rgba(255, 174, 0, 0.1);
+            border: 2px solid var(--warning-orange);
+            color: var(--warning-orange);
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 10px rgba(255, 30, 39, 0.4); }
+            100% { box-shadow: 0 0 25px rgba(255, 30, 39, 0.9); }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Gate Pass Scanner</h2>
+    <p style="color:#aaa; font-size: 13px; margin-bottom: 15px;">Verify attendee QR codes and prevent multiple entries</p>
+    
+    <input type="password" id="adminPassword" placeholder="Enter Admin Password">
+    
+    <div id="reader"></div>
+
+    <div style="margin: 15px 0; color: #777;">— OR MANUAL LOOKUP —</div>
+    <input type="text" id="manualPassId" placeholder="Enter Pass ID (e.g., AD-9K2LM)">
+    <button onclick="verifyPass(document.getElementById('manualPassId').value)">Check Pass</button>
+
+    <div id="resultBox" class="result-box"></div>
+</div>
+
+<script>
+    let isProcessing = false;
+
+    async function verifyPass(qrContent) {
+        if (!qrContent) return;
+        const password = document.getElementById('adminPassword').value;
+        if (!password) {
+            alert('Please enter the Admin Password first.');
+            return;
+        }
+
+        const resultBox = document.getElementById('resultBox');
+        resultBox.style.display = 'block';
+        resultBox.className = 'result-box';
+        resultBox.innerHTML = 'Verifying pass with server...';
+
+        try {
+            const res = await fetch('/api/admin/verify-pass', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password, qrContent })
+            });
+            const data = await res.json();
+
+            if (data.valid) {
+                resultBox.className = 'result-box result-GRANTED';
+                resultBox.innerHTML = `
+                    <h3 style="margin:0 0 8px 0;">${data.message}</h3>
+                    <strong>Attendee:</strong> ${data.booking.name}<br>
+                    <strong>Allowed Persons:</strong> ${data.booking.tickets}<br>
+                    <strong>Booking ID:</strong> ${data.booking.user_id}<br>
+                    <strong>Phone:</strong> ${data.booking.phone}
+                `;
+            } else if (data.code === 'ALREADY_USED') {
+                resultBox.className = 'result-box result-REUSED';
+                resultBox.innerHTML = `
+                    <h3 style="margin:0 0 8px 0;">${data.message}</h3>
+                    <strong>Attendee Name:</strong> ${data.booking.name}<br>
+                    <strong>Tickets:</strong> ${data.booking.tickets}<br>
+                    <strong>First Used At:</strong> ${new Date(data.booking.checked_in_at).toLocaleString()}<br>
+                    <p style="margin:8px 0 0 0; color:#fff;">⚠️ <strong>DO NOT ALLOW ENTRY</strong></p>
+                `;
+            } else {
+                resultBox.className = 'result-box result-INVALID';
+                resultBox.innerHTML = `<h3>${data.message}</h3>`;
+            }
+        } catch (err) {
+            resultBox.className = 'result-box result-INVALID';
+            resultBox.innerHTML = `<h3>Server Connection Error</h3>`;
+        } finally {
+            setTimeout(() => { isProcessing = false; }, 3000); // 3-second debounce before scanning again
+        }
+    }
+
+    function onScanSuccess(decodedText) {
+        if (isProcessing) return;
+        isProcessing = true;
+        verifyPass(decodedText);
+    }
+
+    const html5QrcodeScanner = new Html5QrcodeScanner(
+        "reader", 
+        { fps: 10, qrbox: { width: 250, height: 250 } }, 
+        /* verbose= */ false
+    );
+    html5QrcodeScanner.render(onScanSuccess);
+</script>
+
+</body>
+</html>
