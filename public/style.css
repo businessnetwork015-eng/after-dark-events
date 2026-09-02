@@ -116,7 +116,6 @@ input:focus, select:focus {
     box-shadow: 0 0 15px var(--glow-red);
 }
 
-/* Modal */
 .modal {
     display: none;
     position: fixed;
@@ -153,5 +152,5 @@ input:focus, select:focus {
     color: var(--neon-red);
     border-radius: 4px;
     display: inline-block;
-    margin-bottom: 10px;
+    margin-bottom: 15px;
 }
