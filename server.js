@@ -9,18 +9,22 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Initialize PostgreSQL Connection Pool
+// 1. Neon PostgreSQL Configuration
+const connectionString = (process.env.DATABASE_URL || 'postgresql://neondb_owner:npg_0ZBnK5mweuHx@ep-super-wind-axdm2mdo-pooler.c-4.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require').trim();
+
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
+    connectionString: connectionString,
     ssl: {
         rejectUnauthorized: false
     }
 });
 
-// Initialize Persistent Table
+// Test Connection & Initialize Persistent Table
 async function initDB() {
+    let client;
     try {
-        await pool.query(`
+        client = await pool.connect();
+        await client.query(`
             CREATE TABLE IF NOT EXISTS bookings (
                 id SERIAL PRIMARY KEY,
                 user_id VARCHAR(50) UNIQUE,
@@ -34,15 +38,21 @@ async function initDB() {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log('✅ Connected to Persistent PostgreSQL Database.');
+        console.log('✅ Connected to Neon Cloud PostgreSQL Database.');
     } catch (err) {
-        console.error('❌ Database connection error:', err.message);
+        console.error('❌ Neon Database connection error:', err.message || err);
+    } finally {
+        if (client) client.release();
     }
 }
 initDB();
 
-// Initialize Brevo API
+// 2. Initialize Brevo API
 const brevoKey = (process.env.BREVO_API_KEY || '').trim();
+if (!brevoKey) {
+    console.error("⚠️ Warning: BREVO_API_KEY is not defined in environment variables!");
+}
+
 const apiInstance = new Brevo.TransactionalEmailsApi();
 apiInstance.setApiKey(
     Brevo.TransactionalEmailsApiApiKeys.apiKey,
@@ -53,7 +63,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Helper: Send Step 1 Acknowledgment Email
+// Helper: Send Initial Acknowledgment Email
 async function sendPendingEmail(user) {
     const sendSmtpEmail = new Brevo.SendSmtpEmail();
     sendSmtpEmail.subject = `Payment Received - Booking Under Verification [ID: ${user.user_id}]`;
@@ -77,7 +87,7 @@ async function sendPendingEmail(user) {
     return apiInstance.sendTransacEmail(sendSmtpEmail);
 }
 
-// Helper: Send Step 2 Final Ticket Email
+// Helper: Send Approved Pass with Dynamic QR Code
 async function sendApprovedTicketEmail(user) {
     const qrData = JSON.stringify({
         event: "AFTER DARK",
@@ -132,12 +142,14 @@ async function sendApprovedTicketEmail(user) {
                 <p style="margin: 4px 0; color: #aaa; font-size: 13px;"><strong>Venue:</strong> SIERA BEACH HOTEL, Rushikonda</p>
             </div>
 
-            <p style="font-size: 13px; color: #999;">* Welcome drinks available inside the venue.<br>* Please carry a valid digital/physical ID along with this pass.</p>
+            <p style="font-size: 13px; color: #999;">* Welcome drinks available inside the venue.<br>* Please carry a valid digital or physical ID along with this pass.</p>
         </div>
     `;
 
     return apiInstance.sendTransacEmail(sendSmtpEmail);
 }
+
+// Routes
 
 // User Booking Submission
 app.post('/api/book', async (req, res) => {
@@ -157,12 +169,12 @@ app.post('/api/book', async (req, res) => {
         await pool.query(insertQuery, [userId, name, email, phone, ticketCount, amount, utr_number]);
 
         sendPendingEmail({ name, email, user_id: userId, utr_number })
-            .then(() => console.log(`Confirmation email dispatched to ${email}`))
+            .then(() => console.log(`Confirmation email sent via Brevo to ${email}`))
             .catch(emailErr => console.error('Brevo Email Error:', emailErr.response ? emailErr.response.body : emailErr.message));
 
         res.json({ success: true, bookingId: userId });
     } catch (err) {
-        console.error('Database Error:', err.message);
+        console.error('Database Insertion Error:', err.message);
         res.status(500).json({ success: false, message: 'Failed to record booking.' });
     }
 });
@@ -178,6 +190,7 @@ app.get('/api/admin/bookings', async (req, res) => {
         const result = await pool.query('SELECT * FROM bookings ORDER BY id DESC');
         res.json(result.rows);
     } catch (err) {
+        console.error('Fetch Bookings Error:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -203,14 +216,15 @@ app.post('/api/admin/approve/:id', async (req, res) => {
 
         try {
             await sendApprovedTicketEmail(user);
-            res.json({ success: true, message: 'Approved and ticket sent.' });
+            console.log(`Ticket email sent to ${user.email}`);
+            res.json({ success: true, message: 'Approved and Ticket sent.' });
         } catch (mailErr) {
             console.error('Brevo Approval Email Error:', mailErr.response ? mailErr.response.body : mailErr.message);
-            res.status(500).json({ success: false, message: 'Status updated, but email failed.' });
+            res.status(500).json({ success: false, message: 'Status updated, but email delivery failed.' });
         }
     } catch (err) {
-        console.error('Approval Error:', err.message);
-        res.status(500).json({ success: false, message: 'Database query failed.' });
+        console.error('Approval DB Error:', err.message);
+        res.status(500).json({ success: false, message: 'Database operation failed.' });
     }
 });
 
