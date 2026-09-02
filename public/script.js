@@ -18,13 +18,13 @@ bookingForm.addEventListener('submit', (e) => {
 paymentConfirmForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     
-    const formData = new FormData();
-    formData.append('name', bookingData.name);
-    formData.append('email', bookingData.email);
-    formData.append('phone', bookingData.phone);
-    formData.append('tickets', bookingData.tickets);
-    formData.append('utr_number', document.getElementById('utr_number').value);
-    formData.append('screenshot', document.getElementById('screenshot').files[0]);
+    const payload = {
+        name: bookingData.name,
+        email: bookingData.email,
+        phone: bookingData.phone,
+        tickets: bookingData.tickets,
+        utr_number: document.getElementById('utr_number').value.trim()
+    };
 
     const submitBtn = paymentConfirmForm.querySelector('button');
     submitBtn.innerText = 'Submitting...';
@@ -33,12 +33,15 @@ paymentConfirmForm.addEventListener('submit', async (e) => {
     try {
         const response = await fetch('/api/book', {
             method: 'POST',
-            body: formData
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
         });
         const data = await response.json();
 
         if (data.success) {
-            alert(`Booking Submitted!\nBooking ID: ${data.bookingId}\n\nYou will receive your passes via email within 2-4 hours.`);
+            alert(`Booking Submitted Successfully!\n\nBooking ID: ${data.bookingId}\n\nYou will receive your passes via email within 2-4 hours.`);
             window.location.reload();
         } else {
             alert('Something went wrong. Please try again.');
