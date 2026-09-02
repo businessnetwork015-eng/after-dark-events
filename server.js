@@ -19,7 +19,7 @@ const pool = new Pool({
     }
 });
 
-// Test Connection & Initialize Persistent Table
+// Test Connection & Initialize Persistent Table with Check-in Fields
 async function initDB() {
     let client;
     try {
@@ -35,9 +35,25 @@ async function initDB() {
                 amount INT,
                 utr_number VARCHAR(100),
                 status VARCHAR(20) DEFAULT 'PENDING',
+                is_checked_in BOOLEAN DEFAULT FALSE,
+                checked_in_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
+
+        // Migration check if table already exists without check-in columns
+        await client.query(`
+            DO $$ 
+            BEGIN 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='bookings' AND column_name='is_checked_in') THEN
+                    ALTER TABLE bookings ADD COLUMN is_checked_in BOOLEAN DEFAULT FALSE;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='bookings' AND column_name='checked_in_at') THEN
+                    ALTER TABLE bookings ADD COLUMN checked_in_at TIMESTAMP;
+                END IF;
+            END $$;
+        `);
+
         console.log('✅ Connected to Neon Cloud PostgreSQL Database.');
     } catch (err) {
         console.error('❌ Neon Database connection error:', err.message || err);
@@ -49,10 +65,6 @@ initDB();
 
 // 2. Initialize Brevo API
 const brevoKey = (process.env.BREVO_API_KEY || '').trim();
-if (!brevoKey) {
-    console.error("⚠️ Warning: BREVO_API_KEY is not defined in environment variables!");
-}
-
 const apiInstance = new Brevo.TransactionalEmailsApi();
 apiInstance.setApiKey(
     Brevo.TransactionalEmailsApiApiKeys.apiKey,
@@ -149,8 +161,6 @@ async function sendApprovedTicketEmail(user) {
     return apiInstance.sendTransacEmail(sendSmtpEmail);
 }
 
-// Routes
-
 // User Booking Submission
 app.post('/api/book', async (req, res) => {
     const { name, email, phone, tickets, utr_number } = req.body;
@@ -225,6 +235,83 @@ app.post('/api/admin/approve/:id', async (req, res) => {
     } catch (err) {
         console.error('Approval DB Error:', err.message);
         res.status(500).json({ success: false, message: 'Database operation failed.' });
+    }
+});
+
+// Gate Scanner Verification Endpoint
+app.post('/api/admin/verify-pass', async (req, res) => {
+    const { password, qrContent } = req.body;
+
+    if (password !== process.env.ADMIN_PASSWORD) {
+        return res.status(401).json({ valid: false, message: 'Unauthorized Access' });
+    }
+
+    try {
+        let extractedUserId = qrContent;
+        // Parse payload if full JSON was scanned from the QR code
+        try {
+            const parsed = JSON.parse(qrContent);
+            if (parsed.userId) extractedUserId = parsed.userId;
+        } catch (e) {
+            extractedUserId = qrContent.trim();
+        }
+
+        const queryResult = await pool.query('SELECT * FROM bookings WHERE user_id = $1', [extractedUserId]);
+        const booking = queryResult.rows[0];
+
+        if (!booking) {
+            return res.json({ 
+                valid: false, 
+                code: 'INVALID_PASS', 
+                message: '❌ INVALID PASS: No booking found with this Pass ID!' 
+            });
+        }
+
+        if (booking.status !== 'APPROVED') {
+            return res.json({ 
+                valid: false, 
+                code: 'UNPAID_OR_PENDING', 
+                message: `⚠️ NOT APPROVED: Booking is still marked as ${booking.status}.` 
+            });
+        }
+
+        // Check if pass has already been scanned
+        if (booking.is_checked_in) {
+            const scanTime = new Date(booking.checked_in_at).toLocaleTimeString();
+            return res.json({ 
+                valid: false, 
+                code: 'ALREADY_USED', 
+                message: `🚨 FRAUD / REUSE DETECTED: This pass was ALREADY USED at ${scanTime}!`,
+                booking: {
+                    name: booking.name,
+                    tickets: booking.tickets,
+                    user_id: booking.user_id,
+                    checked_in_at: booking.checked_in_at
+                }
+            });
+        }
+
+        // First time entering: Mark as checked-in
+        await pool.query(
+            'UPDATE bookings SET is_checked_in = TRUE, checked_in_at = CURRENT_TIMESTAMP WHERE id = $1', 
+            [booking.id]
+        );
+
+        return res.json({
+            valid: true,
+            code: 'ENTRY_GRANTED',
+            message: '✅ ENTRY GRANTED: Valid pass verified!',
+            booking: {
+                name: booking.name,
+                tickets: booking.tickets,
+                phone: booking.phone,
+                user_id: booking.user_id
+            }
+        });
+
+    } catch (err) {
+        console.error('Pass verification error:', err.message);
+        res.status(500).json({ valid: false, message: 'Server error verifying ticket' });
     }
 });
 
